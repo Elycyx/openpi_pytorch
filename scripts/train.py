@@ -27,6 +27,11 @@ import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
+if __package__:
+    from scripts import compute_norm_stats as _compute_norm_stats
+else:
+    import compute_norm_stats as _compute_norm_stats
+
 
 def init_logging():
     """Custom logging format for better readability."""
@@ -202,6 +207,8 @@ def main(config: _config.TrainConfig):
 
     jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
 
+    _compute_norm_stats.ensure_norm_stats(config)
+
     rng = jax.random.key(config.seed)
     train_rng, init_rng = jax.random.split(rng)
 
@@ -220,7 +227,7 @@ def main(config: _config.TrainConfig):
     data_loader = _data_loader.create_data_loader(
         config,
         sharding=data_sharding,
-        shuffle=True,
+        shuffle=config.data_shuffle,
     )
     data_iter = iter(data_loader)
     batch = next(data_iter)
@@ -269,7 +276,8 @@ def main(config: _config.TrainConfig):
             infos = []
         batch = next(data_iter)
 
-        if (step % config.save_interval == 0 and step > start_step) or step == config.num_train_steps - 1:
+        should_save_final = config.save_final_checkpoint and step == config.num_train_steps - 1
+        if (step % config.save_interval == 0 and step > start_step) or should_save_final:
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, step)
 
     logging.info("Waiting for checkpoint manager to finish")

@@ -5,6 +5,10 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import logging
+import pathlib
+
+import filelock
 import numpy as np
 import tqdm
 import tyro
@@ -86,8 +90,7 @@ def create_rlds_dataloader(
     return data_loader, num_batches
 
 
-def main(config_name: str, max_frames: int | None = None):
-    config = _config.get_config(config_name)
+def compute_norm_stats(config: _config.TrainConfig, max_frames: int | None = None) -> pathlib.Path:
     data_config = config.data.create(config.assets_dirs, config.model)
 
     if data_config.rlds_data_dir is not None:
@@ -108,9 +111,45 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
-    print(f"Writing stats to: {output_path}")
+    asset_id = data_config.asset_id or data_config.repo_id
+    if asset_id is None:
+        raise ValueError("Data config must have an asset_id or repo_id")
+    assets_dir = config.data.assets.assets_dir or config.assets_dirs
+    if "://" in str(assets_dir):
+        raise ValueError(f"Cannot write computed norm stats to remote assets directory: {assets_dir}")
+    output_path = pathlib.Path(assets_dir) / asset_id
+    logging.info("Writing norm stats to %s", output_path)
     normalize.save(output_path, norm_stats)
+    return output_path
+
+
+def ensure_norm_stats(config: _config.TrainConfig, max_frames: int | None = None) -> bool:
+    data_config = config.data.create(config.assets_dirs, config.model)
+    if data_config.norm_stats is not None or data_config.repo_id in (None, "fake"):
+        return False
+
+    asset_id = data_config.asset_id or data_config.repo_id
+    assets_dir = config.data.assets.assets_dir or config.assets_dirs
+    if "://" in str(assets_dir):
+        raise FileNotFoundError(
+            f"Norm stats are missing from remote assets directory {assets_dir}; "
+            "set --data.assets.assets-dir to a writable local directory."
+        )
+    output_path = pathlib.Path(assets_dir) / asset_id
+    lock_path = output_path.with_suffix(".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with filelock.FileLock(lock_path):
+        data_config = config.data.create(config.assets_dirs, config.model)
+        if data_config.norm_stats is not None:
+            return False
+        logging.info("Norm stats not found at %s; computing them before training", output_path)
+        compute_norm_stats(config, max_frames=max_frames)
+    return True
+
+
+def main(config_name: str, max_frames: int | None = None):
+    config = _config.get_config(config_name)
+    compute_norm_stats(config, max_frames=max_frames)
 
 
 if __name__ == "__main__":

@@ -517,12 +517,17 @@ def convert_pi0_checkpoint(
     all_params = {**paligemma_params, **gemma_params, **projection_params}
 
     # Load state dict
-    pi0_model.load_state_dict(all_params, strict=False)
+    missing, unexpected = pi0_model.load_state_dict(all_params, strict=False)
+    invalid_missing = [name for name in missing if not (name.endswith((".w_a", ".w_b")) or "_lora_" in name)]
+    if invalid_missing or unexpected:
+        raise RuntimeError(
+            f"Checkpoint conversion mismatch: missing={invalid_missing[:10]}, unexpected={unexpected[:10]}"
+        )
 
     if precision == "float32":
         pi0_model = pi0_model.to(torch.float32)
     elif precision == "bfloat16":
-        pi0_model = pi0_model.to(torch.bfloat16)
+        pi0_model.to_bfloat16_for_selected_params("bfloat16")
     else:
         raise ValueError(f"Invalid precision: {precision}")
 

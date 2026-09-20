@@ -27,9 +27,16 @@ import dataclasses
 import gc
 import logging
 import os
+import pathlib
 import platform
 import shutil
+import subprocess
+import sys
 import time
+
+import filelock
+
+os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import jax
 import numpy as np
@@ -42,9 +49,17 @@ import wandb
 
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
+import openpi.shared.download as download_lib
 import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
+from openpi.training.ema import ExponentialMovingAverage
+import openpi.training.weight_loaders as _weight_loaders
+
+if __package__:
+    from scripts import compute_norm_stats as _compute_norm_stats
+else:
+    import compute_norm_stats as _compute_norm_stats
 
 
 def init_logging():
@@ -94,18 +109,22 @@ def init_wandb(config: _config.TrainConfig, *, resuming: bool, enabled: bool = T
 def setup_ddp():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.set_device(device)
+
     if use_ddp and not torch.distributed.is_initialized():
         backend = "nccl" if torch.cuda.is_available() else "gloo"
-        torch.distributed.init_process_group(backend=backend, init_method="env://")
+        init_kwargs = {"backend": backend, "init_method": "env://"}
+        if device.type == "cuda":
+            init_kwargs["device_id"] = device
+        torch.distributed.init_process_group(**init_kwargs)
 
         # Set up debugging environment variables for DDP issues
         if os.environ.get("TORCH_DISTRIBUTED_DEBUG") is None:
             os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
 
-    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
-    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device)
     return use_ddp, local_rank, device
 
 
@@ -124,7 +143,7 @@ def set_seed(seed: int, local_rank: int):
 
 def build_datasets(config: _config.TrainConfig):
     # Use the unified data loader with PyTorch framework
-    data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=True)
+    data_loader = _data.create_data_loader(config, framework="pytorch", shuffle=config.data_shuffle)
     return data_loader, data_loader.data_config()
 
 
@@ -146,13 +165,152 @@ def get_model_parameters(model):
     )
 
 
-def save_checkpoint(model, optimizer, global_step, config, is_main, data_config):
-    """Save a checkpoint with model state, optimizer state, and metadata."""
-    if not is_main:
+def unwrap_model(model):
+    return model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+
+
+def is_lora_parameter_name(name: str) -> bool:
+    return name.endswith((".w_a", ".w_b")) or "_lora_" in name
+
+
+def configure_trainable_parameters(model, model_config) -> None:
+    paligemma_lora = "lora" in model_config.paligemma_variant
+    action_expert_lora = "lora" in model_config.action_expert_variant
+    if not paligemma_lora and not action_expert_lora:
         return
 
+    for name, parameter in model.named_parameters():
+        if not name.startswith("llm."):
+            continue
+        freeze = False
+        if name.startswith("llm.embedder."):
+            freeze = paligemma_lora
+        expert_zero = any(
+            selector in name
+            for selector in (".q_proj.0.", ".k_proj.0.", ".v_proj.0.", ".o_proj.0.", ".mlps.0.", "_norms.0.")
+        )
+        expert_one = any(
+            selector in name
+            for selector in (".q_proj.1.", ".k_proj.1.", ".v_proj.1.", ".o_proj.1.", ".mlps.1.", "_norms.1.")
+        )
+        freeze = freeze or (paligemma_lora and expert_zero) or (action_expert_lora and expert_one)
+        is_lora_parameter = is_lora_parameter_name(name)
+        if freeze and not is_lora_parameter:
+            parameter.requires_grad = False
+
+    for parameter in model.parameters():
+        if parameter.requires_grad:
+            parameter.data = parameter.data.to(dtype=torch.float32)
+
+
+def configured_weight_source(config: _config.TrainConfig) -> str | None:
+    explicit_path = config.pytorch_weight_path
+    if explicit_path and not explicit_path.startswith("/path/to/your"):
+        return explicit_path
+    if isinstance(config.weight_loader, _weight_loaders.CheckpointWeightLoader):
+        return config.weight_loader.params_path
+    return None
+
+
+def checkpoint_root(path: pathlib.Path) -> pathlib.Path:
+    if path.is_file() and path.name == "model.safetensors":
+        return path.parent
+    if path.name == "params":
+        return path.parent
+    return path
+
+
+def _conversion_cuda_device(local_rank: int) -> str:
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if not visible_devices:
+        return str(local_rank)
+    devices = [device.strip() for device in visible_devices.split(",") if device.strip()]
+    return devices[local_rank] if local_rank < len(devices) else devices[0]
+
+
+def resolve_pytorch_weight_path(
+    config: _config.TrainConfig,
+    *,
+    is_main: bool,
+    use_ddp: bool,
+    local_rank: int,
+) -> pathlib.Path | None:
+    source = configured_weight_source(config)
+    if source is None:
+        return None
+
+    resolved_source = None
+    if is_main:
+        resolved_source = checkpoint_root(download_lib.maybe_download(source))
+    if use_ddp:
+        shared_source = [str(resolved_source) if is_main else None]
+        dist.broadcast_object_list(shared_source, src=0)
+        resolved_source = pathlib.Path(shared_source[0])
+    assert resolved_source is not None
+
+    if (resolved_source / "model.safetensors").exists():
+        return resolved_source
+    if not (resolved_source / "params").exists():
+        raise FileNotFoundError(
+            f"Configured weight source is neither a PyTorch checkpoint nor an Orbax checkpoint: {resolved_source}"
+        )
+
+    output_dir = (
+        pathlib.Path(config.checkpoint_base_dir).resolve()
+        / ".converted_weights"
+        / config.name
+        / config.pytorch_training_precision
+        / resolved_source.name
+    )
+    model_path = output_dir / "model.safetensors"
+    if is_main and not model_path.exists():
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = output_dir.with_suffix(".lock")
+        with filelock.FileLock(lock_path):
+            if not model_path.exists():
+                logging.info("Converting configured JAX checkpoint %s to %s", resolved_source, output_dir)
+                environment = os.environ.copy()
+                environment["CUDA_VISIBLE_DEVICES"] = _conversion_cuda_device(local_rank)
+                environment["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+                environment.pop("JAX_PLATFORMS", None)
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(pathlib.Path(__file__).resolve().parents[1] / "examples/convert_jax_model_to_pytorch.py"),
+                        "--checkpoint_dir",
+                        str(resolved_source),
+                        "--config_name",
+                        config.name,
+                        "--output_path",
+                        str(output_dir),
+                        "--precision",
+                        config.pytorch_training_precision,
+                    ],
+                    check=True,
+                    env=environment,
+                )
+                logging.info("Finished converting JAX checkpoint to %s", output_dir)
+    if use_ddp:
+        if is_main:
+            logging.info("Waiting for all ranks to observe the converted checkpoint")
+        dist.barrier()
+    if not model_path.exists():
+        raise FileNotFoundError(f"Automatic PyTorch conversion did not create {model_path}")
+    if is_main:
+        logging.info("Using converted PyTorch checkpoint at %s", output_dir)
+    return output_dir
+
+
+def save_checkpoint(model, optimizer, global_step, config, is_main, data_config, ema=None):
+    """Save a checkpoint with model state, optimizer state, and metadata."""
     # Only save if it's time to save or if it's the final step
-    if (global_step % config.save_interval == 0 and global_step > 0) or global_step == config.num_train_steps - 1:
+    should_save_final = config.save_final_checkpoint and global_step >= config.num_train_steps
+    should_save = (global_step % config.save_interval == 0 and global_step > 0) or should_save_final
+    if not should_save:
+        return
+
+    distributed = dist.is_initialized()
+    if is_main:
         # Create temporary directory for atomic checkpoint saving
         final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
         tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
@@ -162,9 +320,35 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
             shutil.rmtree(tmp_ckpt_dir)
         tmp_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
+    if distributed:
+        dist.barrier()
+
+    final_ckpt_dir = config.checkpoint_dir / f"{global_step}"
+    tmp_ckpt_dir = config.checkpoint_dir / f"tmp_{global_step}"
+    if ema is not None:
+        ema_shard_path = tmp_ckpt_dir / f"ema_rank_{ema.rank}.safetensors"
+        safetensors.torch.save_file(ema.local_state_dict(), ema_shard_path)
+
+    if distributed:
+        dist.barrier()
+
+    if is_main:
         # Save model state using safetensors (handle shared tensors)
-        model_to_save = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
-        safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+        model_to_save = unwrap_model(model)
+        if ema is None:
+            safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "model.safetensors")
+        else:
+            safetensors.torch.save_model(model_to_save, tmp_ckpt_dir / "train_model.safetensors")
+            ema_state = {
+                name: tensor.detach().to(device="cpu")
+                for name, tensor in model_to_save.state_dict().items()
+                if name not in dict(model_to_save.named_parameters())
+            }
+            for rank in range(ema.world_size):
+                shard_path = tmp_ckpt_dir / f"ema_rank_{rank}.safetensors"
+                ema_state.update(safetensors.torch.load_file(shard_path, device="cpu"))
+                shard_path.unlink()
+            safetensors.torch.save_file(ema_state, tmp_ckpt_dir / "model.safetensors")
 
         # Save optimizer state using PyTorch format
         torch.save(optimizer.state_dict(), tmp_ckpt_dir / "optimizer.pt")
@@ -193,8 +377,11 @@ def save_checkpoint(model, optimizer, global_step, config, is_main, data_config)
         if config.wandb_enabled:
             wandb.log({"checkpoint_step": global_step}, step=global_step)
 
+    if distributed:
+        dist.barrier()
 
-def load_checkpoint(model, optimizer, checkpoint_dir, device):
+
+def load_checkpoint(model, optimizer, checkpoint_dir, device, ema=None):
     """Load the latest checkpoint and return the global step."""
     checkpoint_steps = [
         int(d.name)
@@ -217,7 +404,8 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
     try:
         # Load model state with error handling
         logging.info("Loading model state...")
-        safetensors_path = ckpt_dir / "model.safetensors"
+        train_safetensors_path = ckpt_dir / "train_model.safetensors"
+        safetensors_path = train_safetensors_path if train_safetensors_path.exists() else ckpt_dir / "model.safetensors"
 
         if safetensors_path.exists():
             model_to_load = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
@@ -225,6 +413,11 @@ def load_checkpoint(model, optimizer, checkpoint_dir, device):
             logging.info("Loaded model state from safetensors format")
         else:
             raise FileNotFoundError(f"No model checkpoint found at {ckpt_dir}")
+
+        if ema is not None:
+            ema_path = ckpt_dir / "model.safetensors"
+            ema.load_state_dict(safetensors.torch.load_file(ema_path, device=str(device)))
+            logging.info("Loaded EMA state from safetensors format")
 
         torch.cuda.empty_cache()
         gc.collect()
@@ -328,23 +521,34 @@ def train_loop(config: _config.TrainConfig):
                 raise FileNotFoundError(f"No valid checkpoints found in {exp_checkpoint_dir} for resume")
         else:
             raise FileNotFoundError(f"Experiment checkpoint directory {exp_checkpoint_dir} does not exist for resume")
-    elif config.overwrite and config.checkpoint_dir.exists():
+    elif is_main and config.overwrite and config.checkpoint_dir.exists():
         shutil.rmtree(config.checkpoint_dir)
         logging.info(f"Overwriting checkpoint directory: {config.checkpoint_dir}")
+
+    if use_ddp:
+        dist.barrier()
 
     # Create checkpoint directory with experiment name
     if not resuming:
         # For new runs, create experiment-specific checkpoint directory
         exp_checkpoint_dir = config.checkpoint_dir
-        exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
-    else:
+        if is_main:
+            exp_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            logging.info(f"Created experiment checkpoint directory: {exp_checkpoint_dir}")
+        if use_ddp:
+            dist.barrier()
+    elif is_main:
         # For resume, checkpoint_dir is already set to the experiment directory
         logging.info(f"Using existing experiment checkpoint directory: {config.checkpoint_dir}")
 
     # Initialize wandb (only on main process)
     if is_main:
         init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
+
+    if is_main:
+        _compute_norm_stats.ensure_norm_stats(config)
+    if use_ddp:
+        dist.barrier()
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP
@@ -357,6 +561,15 @@ def train_loop(config: _config.TrainConfig):
 
     # Pass the original batch size to data loader - it will handle DDP splitting internally
     loader, data_config = build_datasets(config)
+
+    pretrained_weight_path = None
+    if not resuming:
+        pretrained_weight_path = resolve_pytorch_weight_path(
+            config,
+            is_main=is_main,
+            use_ddp=use_ddp,
+            local_rank=local_rank,
+        )
 
     # Log sample images to wandb on first batch
     if is_main and config.wandb_enabled and not resuming:
@@ -389,6 +602,9 @@ def train_loop(config: _config.TrainConfig):
             torch.cuda.empty_cache()
         logging.info("Cleared sample batch and data loader from memory")
 
+    if is_main:
+        logging.info("Building PyTorch model on %d rank(s)", world_size)
+
     # Build model
     if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
         # Convert dataclass to Pi0Config if needed
@@ -407,6 +623,22 @@ def train_loop(config: _config.TrainConfig):
         object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
 
     model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    configure_trainable_parameters(model, model_cfg)
+    if is_main:
+        logging.info("Finished building PyTorch model")
+        trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+        frozen_parameters = [parameter for parameter in model.parameters() if not parameter.requires_grad]
+        trainable_by_dtype = {}
+        for parameter in trainable_parameters:
+            trainable_by_dtype[str(parameter.dtype)] = (
+                trainable_by_dtype.get(str(parameter.dtype), 0) + parameter.numel()
+            )
+        logging.info(
+            "Parameters: trainable=%d frozen=%d trainable_by_dtype=%s",
+            sum(parameter.numel() for parameter in trainable_parameters),
+            sum(parameter.numel() for parameter in frozen_parameters),
+            trainable_by_dtype,
+        )
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -439,14 +671,17 @@ def train_loop(config: _config.TrainConfig):
         )
 
     # Load weights from weight_loader if specified (for fine-tuning)
-    if config.pytorch_weight_path is not None:
-        logging.info(f"Loading weights from: {config.pytorch_weight_path}")
+    if pretrained_weight_path is not None:
+        logging.info(f"Loading weights from: {pretrained_weight_path}")
 
-        model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        safetensors.torch.load_model(
-            (model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model), model_path
-        )
-        logging.info(f"Loaded PyTorch weights from {config.pytorch_weight_path}")
+        model_path = pretrained_weight_path / "model.safetensors"
+        missing, unexpected = safetensors.torch.load_model(unwrap_model(model), model_path, strict=False)
+        invalid_missing = [name for name in missing if not is_lora_parameter_name(name)]
+        if invalid_missing or unexpected:
+            raise RuntimeError(
+                f"Invalid pretrained checkpoint: missing={invalid_missing[:10]}, unexpected={unexpected[:10]}"
+            )
+        logging.info(f"Loaded PyTorch weights from {pretrained_weight_path}")
 
     # Optimizer + learning rate schedule from config
     warmup_steps = config.lr_schedule.warmup_steps
@@ -456,17 +691,31 @@ def train_loop(config: _config.TrainConfig):
 
     # Create optimizer with config parameters
     optim = torch.optim.AdamW(
-        model.parameters(),
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=peak_lr,
         betas=(config.optimizer.b1, config.optimizer.b2),
         eps=config.optimizer.eps,
         weight_decay=config.optimizer.weight_decay,
     )
 
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    ema = (
+        ExponentialMovingAverage(
+            unwrap_model(model),
+            config.ema_decay,
+            device=device,
+            rank=rank,
+            world_size=world_size,
+        )
+        if config.ema_decay is not None
+        else None
+    )
+
     # Load checkpoint if resuming
     global_step = 0
     if resuming:
-        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device)
+        global_step = load_checkpoint(model, optim, config.checkpoint_dir, device, ema=ema)
         logging.info(f"Resumed training from step {global_step}")
 
     def lr_schedule(step: int):
@@ -496,7 +745,7 @@ def train_loop(config: _config.TrainConfig):
         logging.info(
             f"Optimizer: {type(config.optimizer).__name__}, weight_decay={config.optimizer.weight_decay}, clip_norm={config.optimizer.clip_gradient_norm}"
         )
-        logging.info("EMA is not supported for PyTorch training")
+        logging.info(f"EMA decay: {config.ema_decay}")
         logging.info(f"Training precision: {model_cfg.dtype}")
 
     # Training loop - iterate until we reach num_train_steps
@@ -525,8 +774,11 @@ def train_loop(config: _config.TrainConfig):
             for pg in optim.param_groups:
                 pg["lr"] = lr_schedule(global_step)
 
-            # Forward pass
-            losses = model(observation, actions)
+            # Forward pass. LoRA and other trainable parameters remain fp32 while
+            # matrix multiplications use bf16, matching the JAX training layout.
+            use_autocast = device.type == "cuda" and model_cfg.dtype == "bfloat16"
+            with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=use_autocast):
+                losses = model(observation, actions)
             # Ensure losses is a tensor and handle different return types
             if isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
@@ -534,6 +786,10 @@ def train_loop(config: _config.TrainConfig):
                 losses = torch.tensor(losses, device=device, dtype=torch.float32)
 
             loss = losses.mean()
+            reported_loss = loss.detach()
+            if dist.is_initialized():
+                dist.all_reduce(reported_loss, op=dist.ReduceOp.SUM)
+                reported_loss /= dist.get_world_size()
 
             # Backward pass
             loss.backward()
@@ -547,6 +803,8 @@ def train_loop(config: _config.TrainConfig):
 
             # Optimizer step
             optim.step()
+            if ema is not None:
+                ema.update(unwrap_model(model))
             optim.zero_grad(set_to_none=True)
 
             # Clear gradients more aggressively
@@ -559,7 +817,7 @@ def train_loop(config: _config.TrainConfig):
             if is_main:
                 infos.append(
                     {
-                        "loss": loss.item(),
+                        "loss": reported_loss.item(),
                         "learning_rate": optim.param_groups[0]["lr"],
                         "grad_norm": float(grad_norm) if isinstance(grad_norm, torch.Tensor) else grad_norm,
                     }
@@ -602,13 +860,17 @@ def train_loop(config: _config.TrainConfig):
 
             global_step += 1
             # Save checkpoint using the new mechanism
-            save_checkpoint(model, optim, global_step, config, is_main, data_config)
+            save_checkpoint(model, optim, global_step, config, is_main, data_config, ema=ema)
 
             # Update progress bar
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix(
-                    {"loss": f"{loss.item():.4f}", "lr": f"{optim.param_groups[0]['lr']:.2e}", "step": global_step}
+                    {
+                        "loss": f"{reported_loss.item():.4f}",
+                        "lr": f"{optim.param_groups[0]['lr']:.2e}",
+                        "step": global_step,
+                    }
                 )
 
     # Close progress bar

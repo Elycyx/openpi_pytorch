@@ -148,7 +148,10 @@ To fine-tune a base model on your own data, you need to define configs for data 
 
 We provide example fine-tuning configs for [π₀](src/openpi/training/config.py), [π₀-FAST](src/openpi/training/config.py), and [π₀.₅](src/openpi/training/config.py) on LIBERO data.
 
-Before we can run training, we need to compute the normalization statistics for the training data. Run the script below with the name of your training config:
+At training startup, OpenPI checks the config's assets directory for normalization statistics. If
+`norm_stats.json` is missing, it computes the statistics with the configured dataset and transforms,
+saves them under `assets/<config_name>/<asset_id>/`, and then starts training. You can still precompute
+them manually when desired:
 
 ```bash
 uv run scripts/compute_norm_stats.py --config-name pi05_libero
@@ -192,24 +195,10 @@ We provide more examples for how to fine-tune and run inference with our models 
 openpi now provides PyTorch implementations of π₀ and π₀.₅ models alongside the original JAX versions! The PyTorch implementation has been validated on the LIBERO benchmark (both inference and finetuning). A few features are currently not supported (this may change in the future):
 
 - The π₀-FAST model
-- Mixed precision training
 - FSDP (fully-sharded data parallelism) training
-- LoRA (low-rank adaptation) training
-- EMA (exponential moving average) weights during training
 
 ### Setup
-1. Make sure that you have the latest version of all dependencies installed: `uv sync`
-
-2. Double check that you have transformers 4.53.2 installed: `uv pip show transformers`
-
-3. Apply the transformers library patches:
-   ```bash
-   cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/
-   ```
-
-This overwrites several files in the transformers library with necessary model changes: 1) supporting AdaRMS, 2) correctly controlling the precision of activations, and 3) allowing the KV cache to be used without being updated.
-
-**WARNING**: With the default uv link mode (hardlink), this will permanently affect the transformers library in your uv cache, meaning the changes will survive reinstallations of transformers and could even propagate to other projects that use transformers. To fully undo this operation, you must run `uv cache clean transformers`.
+Install the locked dependencies with `GIT_LFS_SKIP_SMUDGE=1 uv sync`. The PyTorch implementation is self-contained and no longer requires patching the installed Transformers package.
 
 ### Converting JAX Models to PyTorch
 
@@ -253,19 +242,12 @@ uv run scripts/serve_policy.py policy:checkpoint \
 
 ### Finetuning with PyTorch
 
-To finetune a model in PyTorch:
+To finetune a model in PyTorch, launch the PyTorch trainer directly. If `pytorch_weight_path` is unset, the trainer reads the configured JAX
+   `weight_loader`, converts the Orbax checkpoint once on rank 0, caches it under
+   `<checkpoint_base_dir>/.converted_weights/`, and reuses it on later runs. You can still use
+   `pytorch_weight_path` to override the configured weights with an existing PyTorch checkpoint.
 
-1. Convert the JAX base model to PyTorch format:
-   ```bash
-   uv run examples/convert_jax_model_to_pytorch.py \
-       --config_name <config name> \
-       --checkpoint_dir /path/to/jax/base/model \
-       --output_path /path/to/pytorch/base/model
-   ```
-
-2. Specify the converted PyTorch model path in your config using `pytorch_weight_path`
-
-3. Launch training using one of these modes:
+Use one of these modes:
 
 ```bash
 # Single GPU training:
@@ -302,7 +284,7 @@ JAX and PyTorch implementations handle precision as follows:
 
 **PyTorch:**
 1. Inference: matches JAX -- most weights and computations in bfloat16, with a few weights converted to float32 for stability
-2. Training: supports either full bfloat16 (default) or full float32. You can change it by setting `pytorch_training_precision` in the config. bfloat16 uses less memory but exhibits higher losses compared to float32. Mixed precision is not yet supported.
+2. Training: uses the same selective mixed-precision layout as inference by default: Gemma and SigLIP matrix weights use bfloat16, while normalization, vision stem, positional embeddings, and action projections remain float32. Set `pytorch_training_precision` to `float32` for full-float32 training.
 
 With torch.compile, inference speed is comparable between JAX and PyTorch.
 
@@ -315,7 +297,7 @@ We will collect common issues and their solutions here. If you encounter an issu
 | `uv sync` fails with dependency conflicts | Try removing the virtual environment directory (`rm -rf .venv`) and running `uv sync` again. If issues persist, check that you have the latest version of `uv` installed (`uv self update`). |
 | Training runs out of GPU memory           | Make sure you set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.9` (or higher) before running training to allow JAX to use more GPU memory. You can also use `--fsdp-devices <n>` where `<n>` is your number of GPUs, to enable [fully-sharded data parallelism](https://engineering.fb.com/2021/07/15/open-source/fsdp/), which reduces memory usage in exchange for slower training (the amount of slowdown depends on your particular setup). If you are still running out of memory, you may want to consider disabling EMA.        |
 | Policy server connection errors           | Check that the server is running and listening on the expected port. Verify network connectivity and firewall settings between client and server.                                            |
-| Missing norm stats error when training    | Run `scripts/compute_norm_stats.py` with your config name before starting training.                                                                                                          |
+| Missing norm stats error when training    | Training computes missing stats automatically. Check that the configured assets directory is local and writable, or run `scripts/compute_norm_stats.py` manually.                           |
 | Dataset download fails                    | Check your internet connection. For HuggingFace datasets, ensure you're logged in (`huggingface-cli login`).                                                                                 |
 | CUDA/GPU errors                           | Verify NVIDIA drivers are installed correctly. For Docker, ensure nvidia-container-toolkit is installed. Check GPU compatibility. You do NOT need CUDA libraries installed at a system level --- they will be installed via uv. You may even want to try *uninstalling* system CUDA libraries if you run into CUDA issues, since system libraries can sometimes cause conflicts. |
 | Import errors when running examples       | Make sure you've installed all dependencies with `uv sync`. Some examples may have additional requirements listed in their READMEs.                    |

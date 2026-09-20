@@ -136,6 +136,14 @@ ENV/
 env.bak/
 venv.bak/
 
+# Local benchmark outputs and converted checkpoints
+artifacts/
+.agents/
+.codex/
+.eval/
+.ruff_cache/
+.vscode/
+
 # Spyder project settings
 .spyderproject
 .spyproject

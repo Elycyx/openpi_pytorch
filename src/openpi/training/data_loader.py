@@ -313,6 +313,7 @@ def create_torch_data_loader(
                 num_replicas=torch.distributed.get_world_size(),
                 rank=torch.distributed.get_rank(),
                 shuffle=shuffle,
+                seed=seed,
                 drop_last=True,
             )
             local_batch_size = batch_size // torch.distributed.get_world_size()
