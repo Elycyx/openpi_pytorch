@@ -7,7 +7,9 @@ from typing import Literal, Protocol, SupportsIndex, TypeVar
 
 import jax
 import jax.numpy as jnp
+from huggingface_hub import snapshot_download
 import lerobot.common.datasets.lerobot_dataset as lerobot_dataset
+from lerobot.common.constants import HF_LEROBOT_HOME
 import numpy as np
 import torch
 
@@ -137,9 +139,25 @@ def create_torch_dataset(
     if repo_id == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
+    dataset_root = None
+    if data_config.revision is not None:
+        dataset_root = HF_LEROBOT_HOME / repo_id
+        snapshot_download(
+            repo_id,
+            repo_type="dataset",
+            revision=data_config.revision,
+            local_dir=dataset_root,
+        )
+
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(
+        repo_id,
+        root=dataset_root,
+        revision=data_config.revision,
+    )
     dataset = lerobot_dataset.LeRobotDataset(
         data_config.repo_id,
+        root=dataset_root,
+        revision=data_config.revision,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },

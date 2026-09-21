@@ -500,6 +500,8 @@ def log_memory_usage(device, step, phase="unknown"):
 
 
 def train_loop(config: _config.TrainConfig):
+    _compute_norm_stats.ensure_norm_stats(config)
+
     use_ddp, local_rank, device = setup_ddp()
     is_main = (not use_ddp) or (dist.get_rank() == 0)
     set_seed(config.seed, local_rank)
@@ -544,11 +546,6 @@ def train_loop(config: _config.TrainConfig):
     # Initialize wandb (only on main process)
     if is_main:
         init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
-
-    if is_main:
-        _compute_norm_stats.ensure_norm_stats(config)
-    if use_ddp:
-        dist.barrier()
 
     # Build data loader using the unified data loader
     # Calculate effective batch size per GPU for DDP

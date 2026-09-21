@@ -1,4 +1,6 @@
 import dataclasses
+import pathlib
+from unittest import mock
 
 import jax
 
@@ -60,6 +62,40 @@ def test_with_fake_dataset():
 
     for _, actions in batches:
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
+
+
+def test_create_torch_dataset_with_revision():
+    data_config = _config.DataConfig(
+        repo_id="owner/dataset",
+        revision="main",
+        action_sequence_keys=("action",),
+    )
+    model_config = pi0_config.Pi0Config(action_horizon=10)
+    dataset_root = pathlib.Path("/tmp/lerobot/owner/dataset")
+
+    with (
+        mock.patch.object(_data_loader, "HF_LEROBOT_HOME", pathlib.Path("/tmp/lerobot")),
+        mock.patch.object(_data_loader, "snapshot_download") as snapshot_download,
+        mock.patch.object(_data_loader.lerobot_dataset, "LeRobotDatasetMetadata") as metadata_cls,
+        mock.patch.object(_data_loader.lerobot_dataset, "LeRobotDataset") as dataset_cls,
+    ):
+        metadata_cls.return_value.fps = 30
+        dataset = _data_loader.create_torch_dataset(data_config, model_config.action_horizon, model_config)
+
+    snapshot_download.assert_called_once_with(
+        "owner/dataset",
+        repo_type="dataset",
+        revision="main",
+        local_dir=dataset_root,
+    )
+    metadata_cls.assert_called_once_with("owner/dataset", root=dataset_root, revision="main")
+    dataset_cls.assert_called_once_with(
+        "owner/dataset",
+        root=dataset_root,
+        revision="main",
+        delta_timestamps={"action": [step / 30 for step in range(model_config.action_horizon)]},
+    )
+    assert dataset is dataset_cls.return_value
 
 
 def test_with_real_dataset():
