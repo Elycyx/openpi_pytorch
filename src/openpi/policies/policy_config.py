@@ -6,6 +6,7 @@ from typing import Any
 import jax.numpy as jnp
 
 import openpi.models.model as _model
+from openpi.models_pytorch import compile_cache as _compile_cache
 import openpi.policies.policy as _policy
 import openpi.shared.download as download
 from openpi.training import checkpoints as _checkpoints
@@ -51,6 +52,14 @@ def create_trained_policy(
 
     logging.info("Loading model...")
     if is_pytorch:
+        compile_mode = getattr(train_config.model, "pytorch_compile_mode", None)
+        cache_dir = _compile_cache.configure_checkpoint_compile_cache(
+            weight_path,
+            compile_mode=compile_mode,
+            flags=_compile_cache.optimization_flags(train_config.model),
+        )
+        if cache_dir is not None:
+            logging.info("Using persistent PyTorch compile cache: %s", cache_dir)
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.to_bfloat16_for_selected_params("bfloat16")
     else:

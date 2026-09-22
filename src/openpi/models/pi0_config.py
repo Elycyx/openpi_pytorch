@@ -33,6 +33,10 @@ class Pi0Config(_model.BaseModelConfig):
     discrete_state_input: bool = None  # type: ignore
 
     pytorch_compile_mode: str | None = "max-autotune"
+    pytorch_optimize_prefix_cache: bool = True
+    pytorch_discard_suffix_cache: bool = True
+    pytorch_precompute_suffix_metadata: bool = True
+    pytorch_cache_time_embedding_frequencies: bool = True
 
     def __post_init__(self):
         if self.max_token_len is None:

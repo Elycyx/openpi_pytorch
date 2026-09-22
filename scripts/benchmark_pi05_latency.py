@@ -10,6 +10,8 @@ import time
 
 import numpy as np
 
+from openpi.models_pytorch import compile_cache
+
 
 def percentile(values: list[float], value: float) -> float:
     return float(np.percentile(np.asarray(values, dtype=np.float64), value))
@@ -127,7 +129,7 @@ def run_jax_worker(args) -> dict:
     return result
 
 
-def run_pytorch_worker(args, *, compile_model: bool) -> dict:
+def run_pytorch_worker(args, *, compile_model: bool, optimize_inference: bool) -> dict:
     import jax
     import safetensors.torch
     import torch
@@ -142,6 +144,10 @@ def run_pytorch_worker(args, *, compile_model: bool) -> dict:
     model_config = dataclasses.replace(
         config_lib.get_config("pi05_libero_low_mem_finetune").model,
         pytorch_compile_mode=compile_mode,
+        pytorch_optimize_prefix_cache=optimize_inference,
+        pytorch_discard_suffix_cache=optimize_inference,
+        pytorch_precompute_suffix_metadata=optimize_inference,
+        pytorch_cache_time_embedding_frequencies=optimize_inference,
     )
 
     load_started = time.perf_counter()
@@ -174,8 +180,15 @@ def run_pytorch_worker(args, *, compile_model: bool) -> dict:
         torch.cuda.synchronize(device)
         durations.append(time.perf_counter() - started)
 
+    if compile_model:
+        backend = "pytorch_compile_max_autotune_optimized" if optimize_inference else "pytorch_compile_max_autotune"
+    else:
+        backend = "pytorch_eager"
+
     return {
-        "backend": "pytorch_compile_max_autotune" if compile_model else "pytorch_eager",
+        "backend": backend,
+        "inference_optimizations": optimize_inference,
+        "compile_cache_dir": os.environ.get("TORCHINDUCTOR_CACHE_DIR") if compile_model else None,
         "model_load_seconds": load_seconds,
         "compile_and_first_inference_seconds": compile_seconds,
         "warmup_seconds": warmup_seconds,
@@ -191,9 +204,11 @@ def worker_main(args) -> None:
     if args.worker == "jax":
         result = run_jax_worker(args)
     elif args.worker == "pytorch-eager":
-        result = run_pytorch_worker(args, compile_model=False)
+        result = run_pytorch_worker(args, compile_model=False, optimize_inference=False)
+    elif args.worker == "pytorch-compile":
+        result = run_pytorch_worker(args, compile_model=True, optimize_inference=False)
     else:
-        result = run_pytorch_worker(args, compile_model=True)
+        result = run_pytorch_worker(args, compile_model=True, optimize_inference=True)
     args.worker_output.write_text(json.dumps(result, indent=2))
 
 
@@ -224,7 +239,14 @@ def run_worker(args, worker: str) -> dict:
     environment = os.environ.copy()
     environment["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     environment["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
-    environment.setdefault("TORCHINDUCTOR_CACHE_DIR", str(args.output_dir / "torchinductor_cache"))
+    if worker in ("pytorch-compile", "pytorch-compile-optimized"):
+        optimize_inference = worker == "pytorch-compile-optimized"
+        compile_cache.configure_checkpoint_compile_cache(
+            args.pytorch_checkpoint,
+            compile_mode="max-autotune",
+            flags=(optimize_inference,) * len(compile_cache.INFERENCE_OPTIMIZATION_FIELDS),
+            environ=environment,
+        )
     log_path = args.output_dir / f"{worker}.log"
     print(f"Running {worker}; log: {log_path}", flush=True)
     started = time.perf_counter()
@@ -244,12 +266,12 @@ def run_worker(args, worker: str) -> dict:
 def print_results(results: list[dict]) -> None:
     print("\nPi0.5 latency benchmark")
     print(
-        f"{'Backend':34} {'Compile/first(s)':>18} {'Mean(ms)':>10} {'P50(ms)':>10} {'P95(ms)':>10} {'Samples/s':>10} {'Peak GiB':>10}"
+        f"{'Backend':42} {'Compile/first(s)':>18} {'Mean(ms)':>10} {'P50(ms)':>10} {'P95(ms)':>10} {'Samples/s':>10} {'Peak GiB':>10}"
     )
     for result in results:
         latency = result["latency"]
         print(
-            f"{result['backend']:34} "
+            f"{result['backend']:42} "
             f"{result['compile_and_first_inference_seconds']:18.2f} "
             f"{latency['mean_ms']:10.2f} "
             f"{latency['p50_ms']:10.2f} "
@@ -285,13 +307,23 @@ def main() -> None:
     parser.add_argument("--force-prepare", action="store_true")
     parser.add_argument("--skip-compile", action="store_true")
     parser.add_argument("--worker-timeout", type=int, default=1800)
-    parser.add_argument("--worker", choices=("jax", "pytorch-eager", "pytorch-compile"))
+    parser.add_argument(
+        "--worker",
+        choices=("jax", "pytorch-eager", "pytorch-compile", "pytorch-compile-optimized"),
+    )
     parser.add_argument("--worker-output", type=pathlib.Path)
     args = parser.parse_args()
 
     if args.worker:
         if args.worker_output is None:
             raise ValueError("--worker-output is required in worker mode")
+        if args.worker in ("pytorch-compile", "pytorch-compile-optimized"):
+            optimize_inference = args.worker == "pytorch-compile-optimized"
+            compile_cache.configure_checkpoint_compile_cache(
+                args.pytorch_checkpoint,
+                compile_mode="max-autotune",
+                flags=(optimize_inference,) * len(compile_cache.INFERENCE_OPTIMIZATION_FIELDS),
+            )
         worker_main(args)
         return
 
@@ -299,7 +331,7 @@ def main() -> None:
     prepare_libero_batch(args)
     workers = ["jax", "pytorch-eager"]
     if not args.skip_compile:
-        workers.append("pytorch-compile")
+        workers.extend(["pytorch-compile", "pytorch-compile-optimized"])
     results = [run_worker(args, worker) for worker in workers]
     summary = {
         "jax_checkpoint": str(args.jax_checkpoint),

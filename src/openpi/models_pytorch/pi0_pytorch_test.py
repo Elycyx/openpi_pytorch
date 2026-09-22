@@ -20,7 +20,7 @@ class _TinyImageEncoder(nn.Module):
         return tokens.expand(-1, 4, -1), None
 
 
-def _config(*, pi05: bool):
+def _config(*, pi05: bool, optimize_inference: bool = True):
     return SimpleNamespace(
         action_dim=8,
         action_horizon=3,
@@ -30,6 +30,10 @@ def _config(*, pi05: bool):
         action_expert_variant="dummy",
         pi05=pi05,
         pytorch_compile_mode=None,
+        pytorch_optimize_prefix_cache=optimize_inference,
+        pytorch_discard_suffix_cache=optimize_inference,
+        pytorch_precompute_suffix_metadata=optimize_inference,
+        pytorch_cache_time_embedding_frequencies=optimize_inference,
     )
 
 
@@ -63,6 +67,44 @@ def test_loss_and_sampling(monkeypatch, pi05):
     assert sampled.shape == actions.shape
     assert torch.isfinite(loss).all()
     assert torch.isfinite(sampled).all()
+
+
+@pytest.mark.parametrize("pi05", [False, True])
+def test_inference_optimizations_preserve_exact_outputs(monkeypatch, pi05):
+    monkeypatch.setattr(pi0_pytorch.siglip, "SigLIPViT", _TinyImageEncoder)
+    monkeypatch.setattr(pi0_pytorch.gemma, "PALIGEMMA_VOCAB_SIZE", 128)
+    torch.manual_seed(7)
+    baseline = pi0_pytorch.PI0Pytorch(_config(pi05=pi05, optimize_inference=False)).eval()
+    optimized = pi0_pytorch.PI0Pytorch(_config(pi05=pi05, optimize_inference=True)).eval()
+    optimized.load_state_dict(baseline.state_dict())
+
+    observation = _observation()
+    noise = torch.randn(2, 3, 8)
+    baseline_actions = baseline.sample_actions("cpu", observation, noise=noise, num_steps=2)
+    optimized_actions = optimized.sample_actions("cpu", observation, noise=noise, num_steps=2)
+
+    torch.testing.assert_close(optimized_actions, baseline_actions, rtol=0, atol=0)
+
+
+def test_optimized_prefix_cache_skips_last_layer_output(monkeypatch):
+    monkeypatch.setattr(pi0_pytorch.siglip, "SigLIPViT", _TinyImageEncoder)
+    monkeypatch.setattr(pi0_pytorch.gemma, "PALIGEMMA_VOCAB_SIZE", 128)
+    model = pi0_pytorch.PI0Pytorch(_config(pi05=True)).eval()
+    calls = {"query": 0, "output": 0, "mlp": 0}
+    last_layer = model.llm.layers[-1]
+
+    hooks = [
+        last_layer.attn.q_proj[0].register_forward_hook(lambda *_: calls.__setitem__("query", calls["query"] + 1)),
+        last_layer.attn.o_proj[0].register_forward_hook(lambda *_: calls.__setitem__("output", calls["output"] + 1)),
+        last_layer.mlps[0].register_forward_hook(lambda *_: calls.__setitem__("mlp", calls["mlp"] + 1)),
+    ]
+    observation = model_pytorch.preprocess_observation(_observation(), train=False)
+    observation = model_pytorch.observation_to_dtype(observation, model.embed_dtype)
+    model.build_prefix_cache(observation)
+    for hook in hooks:
+        hook.remove()
+
+    assert calls == {"query": 0, "output": 0, "mlp": 0}
 
 
 def test_old_checkpoint_conversion_preserves_shared_embedder():

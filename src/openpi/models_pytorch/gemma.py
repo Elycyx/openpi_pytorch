@@ -396,6 +396,39 @@ class Attention(nn.Module):
 
         return outputs, new_kv_cache
 
+    def build_kv_cache(
+        self,
+        xs: list[torch.Tensor | None],
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project only K/V for a cache entry without computing attention outputs."""
+        k_parts, v_parts = [], []
+        for i, x in enumerate(xs):
+            if x is None:
+                continue
+
+            batch_size, sequence_length, _ = x.shape
+            if isinstance(self.q_proj[i], lora.Einsum):
+                if self.k_proj[i] is None:
+                    _, k, v = self.q_proj[i](x).unbind(dim=0)
+                else:
+                    k, v = self.k_proj[i](x).unbind(dim=0)
+            elif self.k_proj[i] is None:
+                qkv = self.q_proj[i](x)
+                qkv = qkv.reshape(batch_size, sequence_length, 3, self.num_heads, self.head_dim)
+                _, k, v = qkv.unbind(dim=2)
+            else:
+                k = self.k_proj[i](x).reshape(batch_size, sequence_length, self.num_kv_heads, self.head_dim)
+                v = self.v_proj[i](x).reshape(batch_size, sequence_length, self.num_kv_heads, self.head_dim)
+
+            k_parts.append(k)
+            v_parts.append(v)
+
+        k = torch.cat(k_parts, dim=1)
+        v = torch.cat(v_parts, dim=1)
+        k = _apply_rope(k, positions=positions)
+        return k, v
+
 
 class FeedForward(nn.Module):
     """Feed forward module."""
@@ -510,6 +543,22 @@ class Block(nn.Module):
 
         return xs, kv_cache
 
+    def build_kv_cache(
+        self,
+        xs: list[torch.Tensor | None],
+        positions: torch.Tensor,
+        adarms_cond: list[torch.Tensor | None],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build this layer's K/V cache without computing its unused output."""
+        pre_attn = []
+        for i, x in enumerate(xs):
+            if x is not None:
+                x_norm, _ = self.pre_attention_norms[i](x, adarms_cond[i])
+                pre_attn.append(x_norm)
+            else:
+                pre_attn.append(None)
+        return self.attn.build_kv_cache(pre_attn, positions)
+
 
 class Module(nn.Module):
     """Gemma transformer with multi-expert support."""
@@ -565,7 +614,9 @@ class Module(nn.Module):
         adarms_cond: Sequence[torch.Tensor | None] | None = None,
         *,
         kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
-    ) -> tuple[list[torch.Tensor | None], tuple[torch.Tensor, torch.Tensor]]:
+        cache_only_last_layer: bool = False,
+        return_kv_cache: bool = True,
+    ) -> tuple[list[torch.Tensor | None], tuple[torch.Tensor, torch.Tensor] | None]:
         """Full transformer forward pass.
 
         Args:
@@ -574,6 +625,8 @@ class Module(nn.Module):
             mask: (B, T, S) attention mask (bool)
             adarms_cond: per-expert adaptive conditioning (or None)
             kv_cache: optional KV cache for inference
+            cache_only_last_layer: only project K/V in the final layer
+            return_kv_cache: return newly generated per-layer K/V tensors
 
         Returns:
             (outputs, new_kv_cache)
@@ -601,6 +654,12 @@ class Module(nn.Module):
         new_layer_kv_caches = []
         for i, layer in enumerate(self.layers):
             layer_kv = layer_kv_caches[i] if i < len(layer_kv_caches) else None
+            if cache_only_last_layer and i == len(self.layers) - 1:
+                new_kv = layer.build_kv_cache(xs, positions, list(adarms_cond))
+                if return_kv_cache:
+                    new_layer_kv_caches.append(new_kv)
+                xs = [None] * len(self.configs)
+                break
             if self.gradient_checkpointing and self.training:
                 xs, new_kv = torch.utils.checkpoint.checkpoint(
                     layer,
@@ -613,10 +672,11 @@ class Module(nn.Module):
                 )
             else:
                 xs, new_kv = layer(xs, layer_kv, positions, mask, adarms_cond)
-            new_layer_kv_caches.append(new_kv)
+            if return_kv_cache:
+                new_layer_kv_caches.append(new_kv)
 
         # Return the list of per-layer KV caches
-        kv_cache = tuple(new_layer_kv_caches)
+        kv_cache = tuple(new_layer_kv_caches) if return_kv_cache else None
 
         # Final norm
         outputs = []

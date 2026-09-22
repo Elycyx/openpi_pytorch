@@ -69,6 +69,10 @@ class PI0Pytorch(model.BaseModel):
         self.config = config
         self.pi05 = config.pi05
         self.embed_dtype = _str_to_dtype(config.dtype)
+        self.optimize_prefix_cache = getattr(config, "pytorch_optimize_prefix_cache", True)
+        self.discard_suffix_cache = getattr(config, "pytorch_discard_suffix_cache", True)
+        self.precompute_suffix_metadata = getattr(config, "pytorch_precompute_suffix_metadata", True)
+        self.cache_time_embedding_frequencies = getattr(config, "pytorch_cache_time_embedding_frequencies", True)
 
         paligemma_config = gemma.get_config(config.paligemma_variant)
         action_expert_config = gemma.get_config(config.action_expert_variant)
@@ -96,6 +100,14 @@ class PI0Pytorch(model.BaseModel):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_width, action_expert_width)
             self.action_time_mlp_out = nn.Linear(action_expert_width, action_expert_width)
         self.action_out_proj = nn.Linear(action_expert_width, config.action_dim)
+
+        fraction = torch.linspace(0.0, 1.0, action_expert_width // 2, dtype=torch.float32)
+        period = 4e-3 * (4.0 / 4e-3) ** fraction
+        self.register_buffer(
+            "time_embedding_frequencies",
+            1.0 / period * 2 * torch.pi,
+            persistent=False,
+        )
 
         self._init_weights()
         self.to_bfloat16_for_selected_params(config.dtype)
@@ -202,13 +214,15 @@ class PI0Pytorch(model.BaseModel):
         ar_mask = torch.tensor(ar_mask, device=tokens.device)
         return tokens, input_mask, ar_mask
 
-    def embed_suffix(
+    def embed_suffix_tokens(
         self,
         obs: model.Observation,
         noisy_actions: torch.Tensor,
         timestep: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Embed the suffix (state + noisy actions + time embedding).
+        *,
+        cache_time_embedding_frequencies: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Embed suffix tokens without constructing attention metadata.
 
         Args:
             obs: observation
@@ -217,14 +231,9 @@ class PI0Pytorch(model.BaseModel):
 
         Returns:
             tokens: (B, S, emb_dim)
-            input_mask: (B, S)
-            ar_mask: (S,)
             adarms_cond: (B, emb_dim) or None
         """
-        input_mask = []
         tokens = []
-
-        batch_size = noisy_actions.shape[0]
 
         if not self.pi05:
             # Official PI0Pytorch: upcast state only when state_proj is fp32.
@@ -233,13 +242,16 @@ class PI0Pytorch(model.BaseModel):
                 state = state.to(torch.float32)
             state_token = self.state_proj(state)[:, None, :]
             tokens.append(state_token)
-            input_mask.append(torch.ones(batch_size, 1, dtype=torch.bool, device=state_token.device))
 
         # Embed actions
         action_tokens = self.action_in_proj(noisy_actions)
 
         # Time embedding
-        time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+        if cache_time_embedding_frequencies:
+            sinusoid_input = torch.einsum("i,j->ij", timestep.float(), self.time_embedding_frequencies)
+            time_emb = torch.cat([torch.sin(sinusoid_input), torch.cos(sinusoid_input)], dim=-1).to(timestep.dtype)
+        else:
+            time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
 
         if self.pi05:
             # Time MLP for adaRMS conditioning
@@ -260,24 +272,38 @@ class PI0Pytorch(model.BaseModel):
             adarms_cond = None
 
         tokens.append(action_expert_tokens)
-        input_mask.append(
-            torch.ones(
-                action_expert_tokens.shape[:2],
-                dtype=torch.bool,
-                device=action_expert_tokens.device,
-            )
-        )
-
         tokens = torch.cat(tokens, dim=1)
-        input_mask = torch.cat(input_mask, dim=1)
+        return tokens, adarms_cond
+
+    def make_suffix_masks(self, batch_size: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        suffix_len = self.action_horizon + (0 if self.pi05 else 1)
+        input_mask = torch.ones(batch_size, suffix_len, dtype=torch.bool, device=device)
 
         # Build ar_mask with correct length matching input_mask.shape[1]
-        ar_mask = torch.zeros(input_mask.shape[1], dtype=torch.bool, device=tokens.device)
+        ar_mask = torch.zeros(input_mask.shape[1], dtype=torch.bool, device=device)
         if not self.pi05:
             ar_mask[:2] = True
         else:
             ar_mask[0] = True
 
+        return input_mask, ar_mask
+
+    def embed_suffix(
+        self,
+        obs: model.Observation,
+        noisy_actions: torch.Tensor,
+        timestep: torch.Tensor,
+        *,
+        cache_time_embedding_frequencies: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """Embed suffix tokens and construct their attention metadata."""
+        tokens, adarms_cond = self.embed_suffix_tokens(
+            obs,
+            noisy_actions,
+            timestep,
+            cache_time_embedding_frequencies=cache_time_embedding_frequencies,
+        )
+        input_mask, ar_mask = self.make_suffix_masks(noisy_actions.shape[0], tokens.device)
         return tokens, input_mask, ar_mask, adarms_cond
 
     def compute_loss(
@@ -368,8 +394,21 @@ class PI0Pytorch(model.BaseModel):
             [prefix_tokens, None],
             positions=positions,
             mask=prefix_attn_mask,
+            cache_only_last_layer=self.optimize_prefix_cache,
         )
         return outputs[0], prefix_mask, kv_cache
+
+    def build_suffix_attention_metadata(
+        self,
+        prefix_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build suffix attention mask and positions shared by every Euler step."""
+        suffix_mask, suffix_ar_mask = self.make_suffix_masks(prefix_mask.shape[0], prefix_mask.device)
+        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+        prefix_to_suffix_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_mask.shape[1])
+        full_attn_mask = torch.cat([prefix_to_suffix_mask, suffix_attn_mask], dim=-1)
+        suffix_positions = torch.sum(prefix_mask, dim=-1)[:, None] + torch.cumsum(suffix_mask.int(), dim=-1) - 1
+        return full_attn_mask, suffix_positions
 
     def run_suffix(
         self,
@@ -378,24 +417,40 @@ class PI0Pytorch(model.BaseModel):
         t_tensor: torch.Tensor,
         kv_cache: tuple,
         prefix_mask: torch.Tensor,
+        suffix_attention_metadata: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """One suffix forward pass (action expert) given the prefix KV cache.
 
         Returns the action-expert hidden states sliced to the last
         ``action_horizon`` positions: (B, action_horizon, action_expert_width).
         """
-        suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, t_tensor)
-        suffix_len = suffix_tokens.shape[1]
-        suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
-        prefix_to_suffix_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_len)
-        full_attn_mask = torch.cat([prefix_to_suffix_mask, suffix_attn_mask], dim=-1)
-        suffix_positions = torch.sum(prefix_mask, dim=-1)[:, None] + torch.cumsum(suffix_mask.int(), dim=-1) - 1
+        if suffix_attention_metadata is None:
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation,
+                x_t,
+                t_tensor,
+                cache_time_embedding_frequencies=self.cache_time_embedding_frequencies,
+            )
+            suffix_len = suffix_tokens.shape[1]
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+            prefix_to_suffix_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_len)
+            full_attn_mask = torch.cat([prefix_to_suffix_mask, suffix_attn_mask], dim=-1)
+            suffix_positions = torch.sum(prefix_mask, dim=-1)[:, None] + torch.cumsum(suffix_mask.int(), dim=-1) - 1
+        else:
+            suffix_tokens, adarms_cond = self.embed_suffix_tokens(
+                observation,
+                x_t,
+                t_tensor,
+                cache_time_embedding_frequencies=self.cache_time_embedding_frequencies,
+            )
+            full_attn_mask, suffix_positions = suffix_attention_metadata
         outputs, _ = self.llm(
             [None, suffix_tokens],
             positions=suffix_positions,
             mask=full_attn_mask,
             kv_cache=kv_cache,
             adarms_cond=[None, adarms_cond],
+            return_kv_cache=not self.discard_suffix_cache,
         )
         # Official PI0Pytorch casts suffix hidden states to fp32 before
         # ``action_out_proj`` / the value head.
@@ -484,6 +539,9 @@ class PI0Pytorch(model.BaseModel):
             noise = torch.randn(batch_size, self.action_horizon, self.action_dim, device=device, generator=rng)
 
         _, prefix_mask, kv_cache = self.build_prefix_cache(observation)
+        suffix_attention_metadata = None
+        if self.precompute_suffix_metadata:
+            suffix_attention_metadata = self.build_suffix_attention_metadata(prefix_mask)
 
         x_t = noise
         t = 1.0
@@ -491,7 +549,14 @@ class PI0Pytorch(model.BaseModel):
         # Euler integration
         while t >= -dt / 2:
             t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.float32)
-            suffix_out_act = self.run_suffix(observation, x_t, t_tensor, kv_cache, prefix_mask)
+            suffix_out_act = self.run_suffix(
+                observation,
+                x_t,
+                t_tensor,
+                kv_cache,
+                prefix_mask,
+                suffix_attention_metadata,
+            )
             v_t = self.velocity_from_suffix(suffix_out_act)
             x_t = x_t + dt * v_t
             t = t + dt
